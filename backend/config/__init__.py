@@ -1,25 +1,27 @@
 """
 Digital Ekub Platform – Configuration Package.
 
-This package holds all settings, URLs, WSGI/ASGI entry points,
-and Celery configuration for the Django backend.
+This package initialises the Django environment, loads .env,
+validates Python and database compatibility, and exposes shared
+utilities for the entire backend application.
 """
 
 import os
 import sys
 import logging
+import platform
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional, List, Dict, Any
 
 # ---------------------------------------------------------------------------
 # Package metadata
 # ---------------------------------------------------------------------------
 __version__ = '1.0.0'
 __author__ = 'Digital Ekub Team'
-__description__ = 'Django configuration for the Digital Ekub Platform'
+__app_name__ = 'Ekub Platform Backend'
 
 # ---------------------------------------------------------------------------
-# Import Celery app so it is loaded when Django starts
+# Import Celery app so it is available when Django starts
 # ---------------------------------------------------------------------------
 from .celery import app as celery_app
 
@@ -29,13 +31,15 @@ from .celery import app as celery_app
 __all__ = [
     'celery_app',
     '__version__',
-    '__author__',
-    '__description__',
+    '__app_name__',
     'get_project_root',
     'load_env_file',
     'validate_environment',
-    'setup_logging',
-    'get_project_settings',
+    'setup_early_logging',
+    'get_settings_value',
+    'check_python_version',
+    'get_system_info',
+    'get_database_config',
 ]
 
 # ---------------------------------------------------------------------------
@@ -43,55 +47,72 @@ __all__ = [
 # ---------------------------------------------------------------------------
 def get_project_root() -> Path:
     """
-    Return the absolute path to the project root.
+    Return the absolute path to the project root directory.
 
-    The root is determined by walking up from this file's location
-    until a directory containing 'manage.py' is found. If not found,
-    the parent of the 'backend' folder is returned as a fallback.
+    Walks up from the location of this file until it finds manage.py.
+    Falls back to the parent of the 'backend' directory.
     """
     current = Path(__file__).resolve().parent  # backend/config/
-    # Go up to backend/ then to project root
-    backend_dir = current.parent                 # backend/
-    # Check if manage.py exists in backend_dir or its parent
+    backend_dir = current.parent                # backend/
     for candidate in [backend_dir, backend_dir.parent]:
         if (candidate / 'manage.py').exists():
             return candidate
-    # Fallback: assume project root is one level above backend
     return backend_dir.parent
 
 # ---------------------------------------------------------------------------
-# Environment file loader
+# Environment file loader (with fallback)
 # ---------------------------------------------------------------------------
-def load_env_file(env_file: Optional[Path] = None) -> None:
+def load_env_file(env_file: Optional[Path] = None) -> bool:
     """
     Load environment variables from a .env file.
 
-    If no path is given, it looks for '.env' in the project root.
-    This is used as a fallback when python‑decouple is not used,
-    but we keep it for scenarios where we need explicit loading.
+    Returns True if file was loaded successfully, False otherwise.
+    This is used as a fallback when python-decouple is not used.
     """
     if env_file is None:
         env_file = get_project_root() / '.env'
     if env_file.exists():
-        with open(env_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                key, _, value = line.partition('=')
-                if key and not os.environ.get(key):
-                    os.environ[key] = value.strip()
+        try:
+            with open(env_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    key, _, value = line.partition('=')
+                    if key and not os.environ.get(key):
+                        os.environ[key] = value.strip()
+            return True
+        except Exception as e:
+            print(f"Warning: Could not load .env file: {e}", file=sys.stderr)
+            return False
+    return False
+
+# ---------------------------------------------------------------------------
+# System validation
+# ---------------------------------------------------------------------------
+def check_python_version() -> bool:
+    """Ensure we are running Python 3.10 or higher."""
+    major, minor, _ = sys.version_info[:3]
+    if major < 3 or (major == 3 and minor < 10):
+        print(f"Error: Python 3.10+ required (current: {major}.{minor})", file=sys.stderr)
+        return False
+    return True
+
+def get_system_info() -> Dict[str, str]:
+    """Return system information for logging."""
+    return {
+        'python_version': sys.version,
+        'platform': platform.platform(),
+        'architecture': platform.architecture()[0],
+        'hostname': platform.node(),
+        'processor': platform.processor(),
+    }
 
 # ---------------------------------------------------------------------------
 # Environment validation
 # ---------------------------------------------------------------------------
 def validate_environment(required_vars: Optional[List[str]] = None) -> bool:
-    """
-    Check that all required environment variables are present.
-
-    If not provided, a default list of critical variables is used.
-    Returns True if all are set, False otherwise.
-    """
+    """Check that all required environment variables are present."""
     if required_vars is None:
         required_vars = [
             'SECRET_KEY',
@@ -104,25 +125,25 @@ def validate_environment(required_vars: Optional[List[str]] = None) -> bool:
         ]
     missing = [var for var in required_vars if not os.environ.get(var)]
     if missing:
-        print(f"CRITICAL: Missing environment variables: {', '.join(missing)}")
+        print(f"CRITICAL: Missing environment variables: {', '.join(missing)}", file=sys.stderr)
         return False
     return True
 
 # ---------------------------------------------------------------------------
-# Early logging setup (before Django's logging is configured)
+# Early logging setup (before Django configures logging)
 # ---------------------------------------------------------------------------
-def setup_logging(level: str = 'INFO') -> None:
+def setup_early_logging(level: str = 'INFO') -> logging.Logger:
     """
-    Configure a basic console logger for early‑stage messages.
+    Configure a minimal console logger for early-stage messages.
 
-    This is used before Django's full logging system is available.
-    It logs to stderr with a simple format.
+    This logger is used before Django's full logging system is available.
     """
     logger = logging.getLogger('ekub.config')
     if not logger.handlers:
         handler = logging.StreamHandler(sys.stderr)
         formatter = logging.Formatter(
-            '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
         )
         handler.setFormatter(formatter)
         logger.addHandler(handler)
@@ -130,47 +151,81 @@ def setup_logging(level: str = 'INFO') -> None:
     return logger
 
 # ---------------------------------------------------------------------------
-# Access settings module (convenience)
+# Settings helper (allows retrieval with default fallback)
 # ---------------------------------------------------------------------------
-def get_project_settings():
+def get_settings_value(key: str, default: Any = None) -> Any:
     """
-    Return the Django settings module.
+    Retrieve a setting from environment with a fallback.
 
-    This is useful for scripts that need to access settings
-    without importing the module directly.
+    This is a convenience for scripts that need to access settings
+    before Django is fully loaded.
     """
-    from django.conf import settings
-    return settings
+    return os.environ.get(key, default)
+
+# ---------------------------------------------------------------------------
+# Database configuration helper
+# ---------------------------------------------------------------------------
+def get_database_config() -> Dict[str, str]:
+    """Return the database connection settings as a dictionary."""
+    return {
+        'name': os.environ.get('DB_NAME', 'ekub_db'),
+        'user': os.environ.get('DB_USER', 'ekub_user'),
+        'password': os.environ.get('DB_PASSWORD', ''),
+        'host': os.environ.get('DB_HOST', 'localhost'),
+        'port': os.environ.get('DB_PORT', '5432'),
+        'engine': os.environ.get('DB_ENGINE', 'django.db.backends.postgresql'),
+    }
+
+# ---------------------------------------------------------------------------
+# Application info
+# ---------------------------------------------------------------------------
+def get_app_info() -> Dict[str, str]:
+    """Return application metadata."""
+    return {
+        'app_name': __app_name__,
+        'version': __version__,
+        'author': __author__,
+        'project_root': str(get_project_root()),
+        'environment': os.environ.get('ENV', 'development'),
+    }
 
 # ---------------------------------------------------------------------------
 # Initialisation when this package is imported
 # ---------------------------------------------------------------------------
-# Ensure the project root is on sys.path so all apps can be imported
+
+# 1. Check Python version
+if not check_python_version():
+    sys.exit(1)
+
+# 2. Ensure project root is on sys.path
 project_root = get_project_root()
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-# Try to load .env file as a fallback (decouple will also load it)
-try:
-    load_env_file()
-except Exception:
-    pass  # ignore any errors; decouple will handle it
+# 3. Attempt to load .env file (as a fallback, decouple will also load it)
+load_env_file()
 
-# Validate critical environment variables
-if not validate_environment():
-    # We log a warning but do not crash – the application may still work
-    # if some variables are only needed for optional features.
-    logger = setup_logging()
+# 4. Validate critical environment variables
+env_ok = validate_environment()
+
+# 5. Set up early logger
+logger = setup_early_logging()
+if env_ok:
+    logger.info('Environment variables validated successfully.')
+else:
     logger.warning('Some required environment variables are missing.')
 
-# Set default timezone if not already set
+# 6. Log system information
+logger.info(f'System: {get_system_info()}')
+logger.info(f'App info: {get_app_info()}')
+
+# 7. Set default timezone if not already set
 if not os.environ.get('TZ'):
     os.environ['TZ'] = 'Africa/Addis_Ababa'
+    logger.info('Timezone set to Africa/Addis_Ababa')
 
-# Ensure Django settings module is defined
+# 8. Ensure Django settings module is defined
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
 
-# Log startup
-logger = setup_logging()
-logger.info(f'Config package v{__version__} initialised.')
-logger.info(f'Project root: {project_root}')
+# 9. Log successful initialisation
+logger.info('Config package fully initialised.')
