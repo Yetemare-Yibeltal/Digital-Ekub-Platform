@@ -1,16 +1,15 @@
-# ============================================================================
-# DOCKER COMPOSE FOR DIGITAL EKUB PLATFORM
-# ============================================================================
-# This file is located at the project root: digital-ekub-platform/
-# All paths (build contexts, volumes) are relative to this location.
-# Use 'docker-compose up -d' to start all services.
-# ============================================================================
+# =============================================================================
+# DOCKER COMPOSE - DIGITAL EKUB PLATFORM
+# =============================================================================
+# Location: digital-ekub-platform/docker-compose.yml
+# This file orchestrates all services: database, cache, backend, workers, frontend, and proxy.
+# =============================================================================
 
 version: '3.8'
 
 services:
   # --------------------------------------------------------------------------
-  # PostgreSQL Database
+  # 1. POSTGRESQL DATABASE
   # --------------------------------------------------------------------------
   db:
     image: postgres:15-alpine
@@ -33,7 +32,7 @@ services:
       - ekub_network
 
   # --------------------------------------------------------------------------
-  # Redis (Cache & Celery Broker)
+  # 2. REDIS (CACHE & CELERY BROKER)
   # --------------------------------------------------------------------------
   redis:
     image: redis:7-alpine
@@ -52,7 +51,7 @@ services:
       - ekub_network
 
   # --------------------------------------------------------------------------
-  # Django Backend (Gunicorn)
+  # 3. DJANGO BACKEND (GUNICORN)
   # --------------------------------------------------------------------------
   backend:
     build:
@@ -60,7 +59,7 @@ services:
       dockerfile: Dockerfile
     container_name: ekub_backend
     restart: unless-stopped
-    entrypoint: ./entrypoint.sh   # Runs migrations before starting
+    entrypoint: /entrypoint.sh
     command: gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 4 --threads 2 --timeout 120
     volumes:
       - ./backend:/app
@@ -84,7 +83,7 @@ services:
       - ekub_network
 
   # --------------------------------------------------------------------------
-  # Celery Worker (Async Tasks)
+  # 4. CELERY WORKER (ASYNC TASKS)
   # --------------------------------------------------------------------------
   celery_worker:
     build:
@@ -106,7 +105,7 @@ services:
       - ekub_network
 
   # --------------------------------------------------------------------------
-  # Celery Beat (Scheduler)
+  # 5. CELERY BEAT (SCHEDULER)
   # --------------------------------------------------------------------------
   celery_beat:
     build:
@@ -128,7 +127,7 @@ services:
       - ekub_network
 
   # --------------------------------------------------------------------------
-  # React Frontend (Vite Dev Server)
+  # 6. REACT FRONTEND (VITE DEV SERVER)
   # --------------------------------------------------------------------------
   frontend:
     build:
@@ -151,7 +150,7 @@ services:
       - ekub_network
 
   # --------------------------------------------------------------------------
-  # Nginx Reverse Proxy
+  # 7. NGINX (REVERSE PROXY & STATIC FILE SERVER)
   # --------------------------------------------------------------------------
   nginx:
     image: nginx:alpine
@@ -170,18 +169,18 @@ services:
     networks:
       - ekub_network
 
-# ============================================================================
-# Volumes (persistent data)
-# ============================================================================
+# =============================================================================
+# PERSISTENT VOLUMES
+# =============================================================================
 volumes:
   postgres_data:
   redis_data:
   static_volume:
   media_volume:
 
-# ============================================================================
-# Network
-# ============================================================================
+# =============================================================================
+# NETWORK
+# =============================================================================
 networks:
   ekub_network:
     driver: bridge
