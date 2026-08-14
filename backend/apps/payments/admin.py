@@ -18,7 +18,7 @@ inline relationships, and custom actions for efficient management.
 """
 
 from django.contrib import admin
-from django.contrib.admin import ModelAdmin
+from django.contrib.admin import ModelAdmin, TabularInline
 from django.utils.translation import gettext_lazy as _
 from django.utils import timezone
 from django.urls import reverse
@@ -31,12 +31,12 @@ from django.db import transaction
 from decimal import Decimal
 import csv
 import json
-from io import StringIO
+import logging
 
 from apps.users.models import User
 from apps.groups.models import Group
 from apps.common.constants import PaymentStatus, PaymentMethod, PayoutStatus
-from apps.common.utils import format_currency, log_audit_event
+from apps.common.utils import format_currency, log_audit_event, get_client_ip
 
 from .models import (
     Payment,
@@ -50,6 +50,72 @@ from .models import (
     PaymentMethod,
     PaymentAudit,
 )
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# INLINE CLASSES
+# ============================================================================
+
+class PaymentTransactionInline(TabularInline):
+    """Inline for payment transactions."""
+    model = PaymentTransaction
+    extra = 0
+    fields = ('transaction_id', 'gateway', 'amount', 'status', 'initiated_at', 'completed_at')
+    readonly_fields = ('transaction_id', 'gateway', 'amount', 'status', 'initiated_at', 'completed_at')
+    can_delete = False
+    max_num = 0
+    verbose_name = _('Transaction')
+    verbose_name_plural = _('Transactions')
+
+
+class PaymentGatewayLogInline(TabularInline):
+    """Inline for gateway logs."""
+    model = PaymentGatewayLog
+    extra = 0
+    fields = ('gateway', 'endpoint', 'method', 'response_status', 'created_at')
+    readonly_fields = ('gateway', 'endpoint', 'method', 'response_status', 'created_at')
+    can_delete = False
+    max_num = 10
+    verbose_name = _('Gateway Log')
+    verbose_name_plural = _('Gateway Logs')
+
+
+class PaymentReconciliationInline(TabularInline):
+    """Inline for reconciliations."""
+    model = PaymentReconciliation
+    extra = 0
+    fields = ('external_reference', 'status', 'reconciled_at')
+    readonly_fields = ('external_reference', 'status', 'reconciled_at')
+    can_delete = False
+    max_num = 5
+    verbose_name = _('Reconciliation')
+    verbose_name_plural = _('Reconciliations')
+
+
+class PaymentDisputeInline(TabularInline):
+    """Inline for disputes."""
+    model = PaymentDispute
+    extra = 0
+    fields = ('amount', 'reason', 'status', 'created_at')
+    readonly_fields = ('amount', 'reason', 'status', 'created_at')
+    can_delete = False
+    max_num = 5
+    verbose_name = _('Dispute')
+    verbose_name_plural = _('Disputes')
+
+
+class PaymentAuditInline(TabularInline):
+    """Inline for audit entries."""
+    model = PaymentAudit
+    extra = 0
+    fields = ('action', 'user', 'old_status', 'new_status', 'timestamp')
+    readonly_fields = ('action', 'user', 'old_status', 'new_status', 'timestamp')
+    can_delete = False
+    max_num = 20
+    verbose_name = _('Audit')
+    verbose_name_plural = _('Audits')
 
 
 # ============================================================================
@@ -70,7 +136,6 @@ class PaymentAdmin(ModelAdmin):
         'payment_method_display',
         'status_badge',
         'paid_at_display',
-        'expires_at_display',
         'created_at_display',
         'actions_display',
     )
@@ -95,7 +160,6 @@ class PaymentAdmin(ModelAdmin):
         'user__last_name',
         'group__name',
         'error_message',
-        'metadata',
     )
 
     ordering = ('-created_at',)
@@ -110,11 +174,10 @@ class PaymentAdmin(ModelAdmin):
         'webhook_received',
         'webhook_processed_at',
         'retry_count',
-        'get_transactions_link',
-        'get_gateway_logs_link',
-        'get_reconciliations_link',
-        'get_disputes_link',
-        'get_audit_trail_link',
+        'platform_fee',
+        'gateway_fee',
+        'total_fee',
+        'net_amount',
     )
 
     fieldsets = (
@@ -131,7 +194,6 @@ class PaymentAdmin(ModelAdmin):
                 'status',
             )
         }),
-
         (_('Financial Details'), {
             'fields': (
                 'platform_fee',
@@ -140,7 +202,6 @@ class PaymentAdmin(ModelAdmin):
                 'net_amount',
             )
         }),
-
         (_('Timing'), {
             'fields': (
                 'created_at',
@@ -149,7 +210,6 @@ class PaymentAdmin(ModelAdmin):
                 'expires_at',
             )
         }),
-
         (_('Webhook & Retry'), {
             'fields': (
                 'webhook_received',
@@ -158,7 +218,6 @@ class PaymentAdmin(ModelAdmin):
             ),
             'classes': ('collapse',),
         }),
-
         (_('Refund'), {
             'fields': (
                 'refund_reason',
@@ -166,7 +225,6 @@ class PaymentAdmin(ModelAdmin):
             ),
             'classes': ('collapse',),
         }),
-
         (_('Metadata'), {
             'fields': (
                 'metadata',
@@ -176,18 +234,15 @@ class PaymentAdmin(ModelAdmin):
             ),
             'classes': ('collapse',),
         }),
-
-        (_('Admin Links'), {
-            'fields': (
-                'get_transactions_link',
-                'get_gateway_logs_link',
-                'get_reconciliations_link',
-                'get_disputes_link',
-                'get_audit_trail_link',
-            ),
-            'classes': ('collapse',),
-        }),
     )
+
+    inlines = [
+        PaymentTransactionInline,
+        PaymentGatewayLogInline,
+        PaymentReconciliationInline,
+        PaymentDisputeInline,
+        PaymentAuditInline,
+    ]
 
     actions = [
         'mark_as_completed',
@@ -197,7 +252,6 @@ class PaymentAdmin(ModelAdmin):
         'retry_payments',
         'expire_payments',
         'export_as_csv',
-        'export_as_json',
         'soft_delete_selected',
         'restore_selected',
     ]
@@ -210,7 +264,7 @@ class PaymentAdmin(ModelAdmin):
 
     def reference_display(self, obj):
         return format_html(
-            '<code style="background: #f8f9fa; padding: 2px 6px; border-radius: 4px;">{}</code>',
+            '<code style="background: #f8f9fa; padding: 2px 6px; border-radius: 4px; font-size: 12px;">{}</code>',
             obj.reference
         )
     reference_display.short_description = _('Reference')
@@ -235,16 +289,16 @@ class PaymentAdmin(ModelAdmin):
 
     def payment_method_display(self, obj):
         colors = {
-            PaymentMethod.TELEBIRR: 'blue',
-            PaymentMethod.CHAPA: 'green',
-            PaymentMethod.BANK_TRANSFER: 'purple',
-            PaymentMethod.CASH: 'orange',
-            PaymentMethod.MOBILE_MONEY: 'teal',
-            PaymentMethod.CARD: 'red',
+            'telebirr': 'blue',
+            'chapa': 'green',
+            'bank_transfer': 'purple',
+            'cash': 'orange',
+            'mobile_money': 'teal',
+            'card': 'red',
         }
         color = colors.get(obj.payment_method, 'gray')
         return format_html(
-            '<span style="background: {}; color: white; padding: 2px 8px; border-radius: 12px; font-size: 12px;">{}</span>',
+            '<span style="background: {}; color: white; padding: 2px 8px; border-radius: 12px; font-size: 11px;">{}</span>',
             color,
             obj.get_payment_method_display()
         )
@@ -253,18 +307,18 @@ class PaymentAdmin(ModelAdmin):
 
     def status_badge(self, obj):
         colors = {
-            PaymentStatus.PENDING: 'orange',
-            PaymentStatus.PROCESSING: 'blue',
-            PaymentStatus.COMPLETED: 'green',
-            PaymentStatus.FAILED: 'red',
-            PaymentStatus.CANCELLED: 'gray',
-            PaymentStatus.REFUNDED: 'purple',
-            PaymentStatus.REVERSED: 'darkred',
-            PaymentStatus.EXPIRED: 'gray',
+            'pending': 'orange',
+            'processing': 'blue',
+            'completed': 'green',
+            'failed': 'red',
+            'cancelled': 'gray',
+            'refunded': 'purple',
+            'reversed': 'darkred',
+            'expired': 'gray',
         }
         color = colors.get(obj.status, 'gray')
         return format_html(
-            '<span style="background: {}; color: white; padding: 2px 8px; border-radius: 12px; font-size: 12px;">{}</span>',
+            '<span style="background: {}; color: white; padding: 2px 8px; border-radius: 12px; font-size: 11px;">{}</span>',
             color,
             obj.get_status_display()
         )
@@ -278,13 +332,6 @@ class PaymentAdmin(ModelAdmin):
     paid_at_display.short_description = _('Paid At')
     paid_at_display.admin_order_field = 'paid_at'
 
-    def expires_at_display(self, obj):
-        if obj.expires_at:
-            return obj.expires_at.strftime('%Y-%m-%d %H:%M')
-        return '-'
-    expires_at_display.short_description = _('Expires')
-    expires_at_display.admin_order_field = 'expires_at'
-
     def created_at_display(self, obj):
         return obj.created_at.strftime('%Y-%m-%d %H:%M')
     created_at_display.short_description = _('Created')
@@ -292,37 +339,52 @@ class PaymentAdmin(ModelAdmin):
 
     def actions_display(self, obj):
         actions = []
-        if obj.status in [PaymentStatus.PENDING, PaymentStatus.PROCESSING]:
+        if obj.status in ['pending', 'processing']:
             actions.append(
                 format_html(
-                    '<button onclick="location.href=\'{}\'" style="background: #28a745; color: white; border: none; padding: 2px 8px; border-radius: 3px; cursor: pointer; margin: 2px;">Complete</button>',
+                    '<button onclick="location.href=\'{}\'" '
+                    'style="background: #28a745; color: white; border: none; '
+                    'padding: 2px 8px; border-radius: 3px; cursor: pointer; '
+                    'margin: 1px; font-size: 11px;">Complete</button>',
                     f'/admin/payments/payment/{obj.id}/complete/'
                 )
             )
             actions.append(
                 format_html(
-                    '<button onclick="location.href=\'{}\'" style="background: #dc3545; color: white; border: none; padding: 2px 8px; border-radius: 3px; cursor: pointer; margin: 2px;">Fail</button>',
+                    '<button onclick="location.href=\'{}\'" '
+                    'style="background: #dc3545; color: white; border: none; '
+                    'padding: 2px 8px; border-radius: 3px; cursor: pointer; '
+                    'margin: 1px; font-size: 11px;">Fail</button>',
                     f'/admin/payments/payment/{obj.id}/fail/'
                 )
             )
         if obj.can_be_cancelled:
             actions.append(
                 format_html(
-                    '<button onclick="location.href=\'{}\'" style="background: #ffc107; color: black; border: none; padding: 2px 8px; border-radius: 3px; cursor: pointer; margin: 2px;">Cancel</button>',
+                    '<button onclick="location.href=\'{}\'" '
+                    'style="background: #ffc107; color: black; border: none; '
+                    'padding: 2px 8px; border-radius: 3px; cursor: pointer; '
+                    'margin: 1px; font-size: 11px;">Cancel</button>',
                     f'/admin/payments/payment/{obj.id}/cancel/'
                 )
             )
         if obj.can_be_refunded:
             actions.append(
                 format_html(
-                    '<button onclick="location.href=\'{}\'" style="background: #17a2b8; color: white; border: none; padding: 2px 8px; border-radius: 3px; cursor: pointer; margin: 2px;">Refund</button>',
+                    '<button onclick="location.href=\'{}\'" '
+                    'style="background: #17a2b8; color: white; border: none; '
+                    'padding: 2px 8px; border-radius: 3px; cursor: pointer; '
+                    'margin: 1px; font-size: 11px;">Refund</button>',
                     f'/admin/payments/payment/{obj.id}/refund/'
                 )
             )
         if obj.can_be_retried:
             actions.append(
                 format_html(
-                    '<button onclick="location.href=\'{}\'" style="background: #6c757d; color: white; border: none; padding: 2px 8px; border-radius: 3px; cursor: pointer; margin: 2px;">Retry</button>',
+                    '<button onclick="location.href=\'{}\'" '
+                    'style="background: #6c757d; color: white; border: none; '
+                    'padding: 2px 8px; border-radius: 3px; cursor: pointer; '
+                    'margin: 1px; font-size: 11px;">Retry</button>',
                     f'/admin/payments/payment/{obj.id}/retry/'
                 )
             )
@@ -330,114 +392,90 @@ class PaymentAdmin(ModelAdmin):
     actions_display.short_description = _('Actions')
     actions_display.allow_tags = True
 
-    def get_transactions_link(self, obj):
-        url = reverse('admin:payments_paymenttransaction_changelist') + f'?payment__id__exact={obj.id}'
-        count = obj.transactions.count()
-        return format_html('<a href="{}">View Transactions ({})</a>', url, count)
-    get_transactions_link.short_description = _('Transactions')
-
-    def get_gateway_logs_link(self, obj):
-        url = reverse('admin:payments_paymentgatewaylog_changelist') + f'?payment__id__exact={obj.id}'
-        count = obj.gateway_logs.count()
-        return format_html('<a href="{}">View Gateway Logs ({})</a>', url, count)
-    get_gateway_logs_link.short_description = _('Gateway Logs')
-
-    def get_reconciliations_link(self, obj):
-        url = reverse('admin:payments_paymentreconciliation_changelist') + f'?payment__id__exact={obj.id}'
-        count = obj.reconciliations.count()
-        return format_html('<a href="{}">View Reconciliations ({})</a>', url, count)
-    get_reconciliations_link.short_description = _('Reconciliations')
-
-    def get_disputes_link(self, obj):
-        url = reverse('admin:payments_paymentdispute_changelist') + f'?payment__id__exact={obj.id}'
-        count = obj.disputes.count()
-        return format_html('<a href="{}">View Disputes ({})</a>', url, count)
-    get_disputes_link.short_description = _('Disputes')
-
-    def get_audit_trail_link(self, obj):
-        url = reverse('admin:payments_paymentaudit_changelist') + f'?payment__id__exact={obj.id}'
-        count = obj.audits.count()
-        return format_html('<a href="{}">View Audit Trail ({})</a>', url, count)
-    get_audit_trail_link.short_description = _('Audit Trail')
-
     # --------------------------------------------------------------------------
     # CUSTOM ACTIONS
     # --------------------------------------------------------------------------
 
     def mark_as_completed(self, request, queryset):
         count = 0
-        for payment in queryset.filter(status__in=[PaymentStatus.PENDING, PaymentStatus.PROCESSING]):
-            payment.complete()
-            count += 1
+        for payment in queryset.filter(status__in=['pending', 'processing']):
+            try:
+                payment.complete()
+                count += 1
+            except Exception as e:
+                self.message_user(request, f'Error completing payment {payment.id}: {str(e)}', messages.ERROR)
         self.message_user(request, f'Marked {count} payment(s) as completed.')
     mark_as_completed.short_description = _('Mark selected as completed')
 
     def mark_as_failed(self, request, queryset):
         count = 0
-        for payment in queryset.filter(status__in=[PaymentStatus.PENDING, PaymentStatus.PROCESSING]):
-            payment.fail('Marked failed via admin')
-            count += 1
+        for payment in queryset.filter(status__in=['pending', 'processing']):
+            try:
+                payment.fail('Marked failed via admin')
+                count += 1
+            except Exception as e:
+                self.message_user(request, f'Error failing payment {payment.id}: {str(e)}', messages.ERROR)
         self.message_user(request, f'Marked {count} payment(s) as failed.')
     mark_as_failed.short_description = _('Mark selected as failed')
 
     def cancel_payments(self, request, queryset):
         count = 0
-        for payment in queryset.filter(status__in=[PaymentStatus.PENDING, PaymentStatus.PROCESSING]):
-            payment.cancel()
-            count += 1
+        for payment in queryset.filter(status__in=['pending', 'processing']):
+            try:
+                payment.cancel()
+                count += 1
+            except Exception as e:
+                self.message_user(request, f'Error cancelling payment {payment.id}: {str(e)}', messages.ERROR)
         self.message_user(request, f'Cancelled {count} payment(s).')
     cancel_payments.short_description = _('Cancel selected payments')
 
     def refund_payments(self, request, queryset):
-        reason = request.POST.get('reason', 'Refunded via admin')
         count = 0
-        for payment in queryset.filter(status=PaymentStatus.COMPLETED):
-            payment.refund(reason)
-            count += 1
+        for payment in queryset.filter(status='completed'):
+            try:
+                payment.refund('Refunded via admin')
+                count += 1
+            except Exception as e:
+                self.message_user(request, f'Error refunding payment {payment.id}: {str(e)}', messages.ERROR)
         self.message_user(request, f'Refunded {count} payment(s).')
     refund_payments.short_description = _('Refund selected payments')
 
     def retry_payments(self, request, queryset):
         count = 0
-        for payment in queryset.filter(status=PaymentStatus.FAILED, retry_count__lt=3):
-            payment.retry()
-            count += 1
+        for payment in queryset.filter(status='failed', retry_count__lt=3):
+            try:
+                payment.retry()
+                count += 1
+            except Exception as e:
+                self.message_user(request, f'Error retrying payment {payment.id}: {str(e)}', messages.ERROR)
         self.message_user(request, f'Retried {count} payment(s).')
     retry_payments.short_description = _('Retry selected payments')
 
     def expire_payments(self, request, queryset):
-        count = queryset.filter(status=PaymentStatus.PENDING).update(status=PaymentStatus.EXPIRED)
+        count = queryset.filter(status='pending').update(status='expired')
         self.message_user(request, f'Expired {count} payment(s).')
     expire_payments.short_description = _('Expire selected payments')
 
     def export_as_csv(self, request, queryset):
-        meta = self.model._meta
-        field_names = ['id', 'reference', 'user__email', 'group__name', 'amount', 'payment_method', 'status', 'paid_at', 'created_at']
         response = HttpResponse(content_type='text/csv')
-        response['Content-Disposition'] = f'attachment; filename={meta.verbose_name_plural}.csv'
+        response['Content-Disposition'] = 'attachment; filename=payments.csv'
         writer = csv.writer(response)
-        writer.writerow(field_names)
+        writer.writerow(['ID', 'Reference', 'User', 'Group', 'Amount', 'Method', 'Status', 'Paid At', 'Created At'])
         for obj in queryset:
-            row = [
-                obj.id, obj.reference, obj.user.email, obj.group.name,
-                float(obj.amount), obj.get_payment_method_display(),
+            writer.writerow([
+                obj.id,
+                obj.reference,
+                obj.user.email,
+                obj.group.name,
+                float(obj.amount),
+                obj.get_payment_method_display(),
                 obj.get_status_display(),
                 obj.paid_at.strftime('%Y-%m-%d %H:%M') if obj.paid_at else '',
                 obj.created_at.strftime('%Y-%m-%d %H:%M'),
-            ]
-            writer.writerow(row)
+            ])
         self.message_user(request, f'Exported {queryset.count()} payment(s).')
         return response
     export_as_csv.short_description = _('Export selected as CSV')
-
-    def export_as_json(self, request, queryset):
-        from django.core.serializers.json import DjangoJSONEncoder
-        data = list(queryset.values('id', 'reference', 'user__email', 'group__name', 'amount', 'status', 'paid_at', 'created_at'))
-        response = HttpResponse(json.dumps(data, cls=DjangoJSONEncoder, indent=2), content_type='application/json')
-        response['Content-Disposition'] = 'attachment; filename=payments.json'
-        self.message_user(request, f'Exported {queryset.count()} payment(s).')
-        return response
-    export_as_json.short_description = _('Export selected as JSON')
 
     def soft_delete_selected(self, request, queryset):
         count = 0
@@ -472,32 +510,47 @@ class PaymentAdmin(ModelAdmin):
 
     def complete_view(self, request, payment_id):
         payment = get_object_or_404(Payment, id=payment_id)
-        payment.complete()
-        self.message_user(request, f'Payment #{payment.id} completed.')
+        try:
+            payment.complete()
+            self.message_user(request, f'Payment #{payment.id} completed.')
+        except Exception as e:
+            self.message_user(request, f'Error: {str(e)}', messages.ERROR)
         return HttpResponseRedirect(reverse('admin:payments_payment_changelist'))
 
     def fail_view(self, request, payment_id):
         payment = get_object_or_404(Payment, id=payment_id)
-        payment.fail('Failed via admin')
-        self.message_user(request, f'Payment #{payment.id} failed.')
+        try:
+            payment.fail('Failed via admin')
+            self.message_user(request, f'Payment #{payment.id} failed.')
+        except Exception as e:
+            self.message_user(request, f'Error: {str(e)}', messages.ERROR)
         return HttpResponseRedirect(reverse('admin:payments_payment_changelist'))
 
     def cancel_view(self, request, payment_id):
         payment = get_object_or_404(Payment, id=payment_id)
-        payment.cancel()
-        self.message_user(request, f'Payment #{payment.id} cancelled.')
+        try:
+            payment.cancel()
+            self.message_user(request, f'Payment #{payment.id} cancelled.')
+        except Exception as e:
+            self.message_user(request, f'Error: {str(e)}', messages.ERROR)
         return HttpResponseRedirect(reverse('admin:payments_payment_changelist'))
 
     def refund_view(self, request, payment_id):
         payment = get_object_or_404(Payment, id=payment_id)
-        payment.refund('Refunded via admin')
-        self.message_user(request, f'Payment #{payment.id} refunded.')
+        try:
+            payment.refund('Refunded via admin')
+            self.message_user(request, f'Payment #{payment.id} refunded.')
+        except Exception as e:
+            self.message_user(request, f'Error: {str(e)}', messages.ERROR)
         return HttpResponseRedirect(reverse('admin:payments_payment_changelist'))
 
     def retry_view(self, request, payment_id):
         payment = get_object_or_404(Payment, id=payment_id)
-        payment.retry()
-        self.message_user(request, f'Payment #{payment.id} retried.')
+        try:
+            payment.retry()
+            self.message_user(request, f'Payment #{payment.id} retried.')
+        except Exception as e:
+            self.message_user(request, f'Error: {str(e)}', messages.ERROR)
         return HttpResponseRedirect(reverse('admin:payments_payment_changelist'))
 
     # --------------------------------------------------------------------------
@@ -516,6 +569,7 @@ class PaymentAdmin(ModelAdmin):
             action='payment_' + ('created' if not change else 'updated') + '_via_admin',
             resource='payment',
             resource_id=obj.id,
+            ip=get_client_ip(request),
         )
 
 
@@ -549,10 +603,19 @@ class PayoutAdmin(ModelAdmin):
     search_fields = ('id', 'reference', 'user__email', 'group__name', 'reference_number')
     ordering = ('-created_at',)
     readonly_fields = ('id', 'reference', 'created_at', 'updated_at', 'deleted_at', 'created_by')
+
+    fieldsets = (
+        (_('Basic Information'), {'fields': ('user', 'group', 'winner_history', 'amount', 'payout_method', 'status')}),
+        (_('Financial Details'), {'fields': ('platform_fee', 'gateway_fee', 'total_fee', 'net_amount')}),
+        (_('Timing'), {'fields': ('created_at', 'updated_at', 'paid_at')}),
+        (_('Reference'), {'fields': ('reference', 'reference_number', 'notes')}),
+        (_('Metadata'), {'fields': ('created_by', 'deleted_at')}),
+    )
+
     actions = ['mark_completed', 'mark_failed', 'cancel_payouts', 'put_on_hold', 'export_as_csv']
 
     def reference_display(self, obj):
-        return format_html('<code>{}</code>', obj.reference)
+        return format_html('<code style="background: #f8f9fa; padding: 2px 6px; border-radius: 4px; font-size: 12px;">{}</code>', obj.reference)
     reference_display.short_description = _('Reference')
 
     def user_display(self, obj):
@@ -575,16 +638,20 @@ class PayoutAdmin(ModelAdmin):
 
     def status_badge(self, obj):
         colors = {
-            PayoutStatus.PENDING: 'orange',
-            PayoutStatus.PROCESSING: 'blue',
-            PayoutStatus.COMPLETED: 'green',
-            PayoutStatus.FAILED: 'red',
-            PayoutStatus.CANCELLED: 'gray',
-            PayoutStatus.PARTIALLY_PAID: 'purple',
-            PayoutStatus.ON_HOLD: 'darkred',
+            'pending': 'orange',
+            'processing': 'blue',
+            'completed': 'green',
+            'failed': 'red',
+            'cancelled': 'gray',
+            'partially_paid': 'purple',
+            'on_hold': 'darkred',
         }
         color = colors.get(obj.status, 'gray')
-        return format_html('<span style="background: {}; color: white; padding: 2px 8px; border-radius: 12px; font-size: 12px;">{}</span>', color, obj.get_status_display())
+        return format_html(
+            '<span style="background: {}; color: white; padding: 2px 8px; border-radius: 12px; font-size: 11px;">{}</span>',
+            color,
+            obj.get_status_display()
+        )
     status_badge.short_description = _('Status')
 
     def paid_at_display(self, obj):
@@ -598,45 +665,77 @@ class PayoutAdmin(ModelAdmin):
     def actions_display(self, obj):
         actions = []
         if obj.can_be_completed:
-            actions.append(format_html('<button onclick="location.href=\'{}\'" style="background: #28a745; color: white; border: none; padding: 2px 8px; border-radius: 3px; cursor: pointer; margin: 2px;">Complete</button>', f'/admin/payments/payout/{obj.id}/complete/'))
+            actions.append(
+                format_html(
+                    '<button onclick="location.href=\'{}\'" style="background: #28a745; color: white; border: none; padding: 2px 8px; border-radius: 3px; cursor: pointer; margin: 1px; font-size: 11px;">Complete</button>',
+                    f'/admin/payments/payout/{obj.id}/complete/'
+                )
+            )
         if obj.can_be_failed:
-            actions.append(format_html('<button onclick="location.href=\'{}\'" style="background: #dc3545; color: white; border: none; padding: 2px 8px; border-radius: 3px; cursor: pointer; margin: 2px;">Fail</button>', f'/admin/payments/payout/{obj.id}/fail/'))
+            actions.append(
+                format_html(
+                    '<button onclick="location.href=\'{}\'" style="background: #dc3545; color: white; border: none; padding: 2px 8px; border-radius: 3px; cursor: pointer; margin: 1px; font-size: 11px;">Fail</button>',
+                    f'/admin/payments/payout/{obj.id}/fail/'
+                )
+            )
         if obj.can_be_cancelled:
-            actions.append(format_html('<button onclick="location.href=\'{}\'" style="background: #ffc107; color: black; border: none; padding: 2px 8px; border-radius: 3px; cursor: pointer; margin: 2px;">Cancel</button>', f'/admin/payments/payout/{obj.id}/cancel/'))
-        if obj.status in [PayoutStatus.PENDING, PayoutStatus.PROCESSING]:
-            actions.append(format_html('<button onclick="location.href=\'{}\'" style="background: #6c757d; color: white; border: none; padding: 2px 8px; border-radius: 3px; cursor: pointer; margin: 2px;">Hold</button>', f'/admin/payments/payout/{obj.id}/hold/'))
+            actions.append(
+                format_html(
+                    '<button onclick="location.href=\'{}\'" style="background: #ffc107; color: black; border: none; padding: 2px 8px; border-radius: 3px; cursor: pointer; margin: 1px; font-size: 11px;">Cancel</button>',
+                    f'/admin/payments/payout/{obj.id}/cancel/'
+                )
+            )
+        if obj.status in ['pending', 'processing']:
+            actions.append(
+                format_html(
+                    '<button onclick="location.href=\'{}\'" style="background: #6c757d; color: white; border: none; padding: 2px 8px; border-radius: 3px; cursor: pointer; margin: 1px; font-size: 11px;">Hold</button>',
+                    f'/admin/payments/payout/{obj.id}/hold/'
+                )
+            )
         return format_html('&nbsp;'.join(actions))
     actions_display.short_description = _('Actions')
 
     def mark_completed(self, request, queryset):
         count = 0
-        for obj in queryset.filter(status__in=[PayoutStatus.PENDING, PayoutStatus.PROCESSING]):
-            obj.complete()
-            count += 1
+        for obj in queryset.filter(status__in=['pending', 'processing']):
+            try:
+                obj.complete()
+                count += 1
+            except Exception as e:
+                self.message_user(request, f'Error completing payout {obj.id}: {str(e)}', messages.ERROR)
         self.message_user(request, f'Completed {count} payout(s).')
     mark_completed.short_description = _('Mark selected as completed')
 
     def mark_failed(self, request, queryset):
         count = 0
-        for obj in queryset.filter(status__in=[PayoutStatus.PENDING, PayoutStatus.PROCESSING]):
-            obj.fail('Failed via admin')
-            count += 1
+        for obj in queryset.filter(status__in=['pending', 'processing']):
+            try:
+                obj.fail('Failed via admin')
+                count += 1
+            except Exception as e:
+                self.message_user(request, f'Error failing payout {obj.id}: {str(e)}', messages.ERROR)
         self.message_user(request, f'Failed {count} payout(s).')
     mark_failed.short_description = _('Mark selected as failed')
 
     def cancel_payouts(self, request, queryset):
         count = 0
-        for obj in queryset.filter(status__in=[PayoutStatus.PENDING, PayoutStatus.PROCESSING]):
-            obj.cancel('Cancelled via admin')
-            count += 1
+        for obj in queryset.filter(status__in=['pending', 'processing']):
+            try:
+                obj.cancel('Cancelled via admin')
+                count += 1
+            except Exception as e:
+                self.message_user(request, f'Error cancelling payout {obj.id}: {str(e)}', messages.ERROR)
         self.message_user(request, f'Cancelled {count} payout(s).')
     cancel_payouts.short_description = _('Cancel selected payouts')
 
     def put_on_hold(self, request, queryset):
         count = 0
-        for obj in queryset.filter(status__in=[PayoutStatus.PENDING, PayoutStatus.PROCESSING]):
-            obj.put_on_hold('Put on hold via admin')
-            count += 1
+        for obj in queryset.filter(status__in=['pending', 'processing']):
+            try:
+                obj.put_on_hold('Put on hold via admin')
+                count += 1
+            except Exception as e:
+                self.message_user(request, f'Error putting payout {obj.id} on hold: {str(e)}', messages.ERROR)
         self.message_user(request, f'Put {count} payout(s) on hold.')
     put_on_hold.short_description = _('Put selected on hold')
 
@@ -646,13 +745,68 @@ class PayoutAdmin(ModelAdmin):
         writer = csv.writer(response)
         writer.writerow(['ID', 'Reference', 'User', 'Group', 'Amount', 'Status', 'Paid At'])
         for obj in queryset:
-            writer.writerow([obj.id, obj.reference, obj.user.email, obj.group.name, float(obj.amount), obj.get_status_display(), obj.paid_at.strftime('%Y-%m-%d %H:%M') if obj.paid_at else ''])
+            writer.writerow([
+                obj.id,
+                obj.reference,
+                obj.user.email,
+                obj.group.name,
+                float(obj.amount),
+                obj.get_status_display(),
+                obj.paid_at.strftime('%Y-%m-%d %H:%M') if obj.paid_at else ''
+            ])
         self.message_user(request, f'Exported {queryset.count()} payout(s).')
         return response
     export_as_csv.short_description = _('Export selected as CSV')
 
     def get_queryset(self, request):
         return super().get_queryset(request).select_related('user', 'group', 'winner_history', 'created_by')
+
+    def get_urls(self):
+        from django.urls import path
+        urls = super().get_urls()
+        custom_urls = [
+            path('<int:payout_id>/complete/', self.admin_site.admin_view(self.complete_view), name='complete'),
+            path('<int:payout_id>/fail/', self.admin_site.admin_view(self.fail_view), name='fail'),
+            path('<int:payout_id>/cancel/', self.admin_site.admin_view(self.cancel_view), name='cancel'),
+            path('<int:payout_id>/hold/', self.admin_site.admin_view(self.hold_view), name='hold'),
+        ]
+        return custom_urls + urls
+
+    def complete_view(self, request, payout_id):
+        payout = get_object_or_404(Payout, id=payout_id)
+        try:
+            payout.complete()
+            self.message_user(request, f'Payout #{payout.id} completed.')
+        except Exception as e:
+            self.message_user(request, f'Error: {str(e)}', messages.ERROR)
+        return HttpResponseRedirect(reverse('admin:payments_payout_changelist'))
+
+    def fail_view(self, request, payout_id):
+        payout = get_object_or_404(Payout, id=payout_id)
+        try:
+            payout.fail('Failed via admin')
+            self.message_user(request, f'Payout #{payout.id} failed.')
+        except Exception as e:
+            self.message_user(request, f'Error: {str(e)}', messages.ERROR)
+        return HttpResponseRedirect(reverse('admin:payments_payout_changelist'))
+
+    def cancel_view(self, request, payout_id):
+        payout = get_object_or_404(Payout, id=payout_id)
+        try:
+            payout.cancel('Cancelled via admin')
+            self.message_user(request, f'Payout #{payout.id} cancelled.')
+        except Exception as e:
+            self.message_user(request, f'Error: {str(e)}', messages.ERROR)
+        return HttpResponseRedirect(reverse('admin:payments_payout_changelist'))
+
+    def hold_view(self, request, payout_id):
+        payout = get_object_or_404(Payout, id=payout_id)
+        try:
+            payout.put_on_hold('Put on hold via admin')
+            self.message_user(request, f'Payout #{payout.id} put on hold.')
+        except Exception as e:
+            self.message_user(request, f'Error: {str(e)}', messages.ERROR)
+        return HttpResponseRedirect(reverse('admin:payments_payout_changelist'))
 
 
 # ============================================================================
@@ -699,7 +853,7 @@ class PaymentTransactionAdmin(ModelAdmin):
 
 @admin.register(PaymentGatewayLog)
 class PaymentGatewayLogAdmin(ModelAdmin):
-    list_display = ('id', 'gateway', 'endpoint', 'method', 'response_status', 'payment_display', 'created_at_display')
+    list_display = ('id', 'gateway', 'endpoint_short', 'method', 'response_status_display', 'payment_display', 'created_at_display')
     list_filter = ('gateway', 'method', ('payment', admin.RelatedOnlyFieldListFilter))
     search_fields = ('endpoint', 'payment__reference', 'error_message')
     ordering = ('-created_at',)
@@ -709,6 +863,15 @@ class PaymentGatewayLogAdmin(ModelAdmin):
         (_('Response'), {'fields': ('response_status', 'response_headers', 'response_body', 'error_message', 'duration_ms')}),
         (_('Metadata'), {'fields': ('payment', 'created_at')}),
     )
+
+    def endpoint_short(self, obj):
+        return obj.endpoint[:50] + '...' if len(obj.endpoint) > 50 else obj.endpoint
+    endpoint_short.short_description = _('Endpoint')
+
+    def response_status_display(self, obj):
+        color = 'green' if obj.response_status and obj.response_status < 400 else 'red'
+        return format_html('<span style="color: {}; font-weight: bold;">{}</span>', color, obj.response_status)
+    response_status_display.short_description = _('Status')
 
     def payment_display(self, obj):
         url = reverse('admin:payments_payment_change', args=[obj.payment.id])
@@ -743,11 +906,11 @@ class PaymentWebhookLogAdmin(ModelAdmin):
     )
 
     def verified_display(self, obj):
-        return '✓' if obj.verified else '✗'
+        return format_html('<span style="color: {};">✓</span>' if obj.verified else '<span style="color: red;">✗</span>', 'green' if obj.verified else 'red')
     verified_display.short_description = _('Verified')
 
     def processed_display(self, obj):
-        return '✓' if obj.processed else '✗'
+        return format_html('<span style="color: {};">✓</span>' if obj.processed else '<span style="color: orange;">✗</span>', 'green' if obj.processed else 'orange')
     processed_display.short_description = _('Processed')
 
     def created_at_display(self, obj):
@@ -766,7 +929,7 @@ class PaymentWebhookLogAdmin(ModelAdmin):
 
 @admin.register(PaymentReconciliation)
 class PaymentReconciliationAdmin(ModelAdmin):
-    list_display = ('id', 'payment_display', 'user_display', 'external_reference', 'status_display', 'reconciled_at_display')
+    list_display = ('id', 'payment_display', 'user_display', 'external_reference_short', 'status_display', 'reconciled_at_display')
     list_filter = ('status', ('payment', admin.RelatedOnlyFieldListFilter))
     search_fields = ('external_reference', 'payment__reference', 'discrepancy_reason')
     ordering = ('-reconciled_at',)
@@ -783,8 +946,14 @@ class PaymentReconciliationAdmin(ModelAdmin):
         return format_html('<a href="{}">{}</a>', url, obj.user.email)
     user_display.short_description = _('User')
 
+    def external_reference_short(self, obj):
+        return obj.external_reference[:30] + '...' if obj.external_reference and len(obj.external_reference) > 30 else obj.external_reference
+    external_reference_short.short_description = _('External Ref')
+
     def status_display(self, obj):
-        return obj.get_status_display()
+        colors = {'pending': 'orange', 'matched': 'green', 'failed': 'red', 'discrepancy': 'purple'}
+        color = colors.get(obj.status, 'gray')
+        return format_html('<span style="color: {};">{}</span>', color, obj.get_status_display())
     status_display.short_description = _('Status')
 
     def reconciled_at_display(self, obj):
@@ -792,12 +961,20 @@ class PaymentReconciliationAdmin(ModelAdmin):
     reconciled_at_display.short_description = _('Reconciled')
 
     def mark_matched(self, request, queryset):
-        count = queryset.update(status='matched')
+        count = 0
+        for obj in queryset:
+            obj.status = 'matched'
+            obj.save(update_fields=['status'])
+            count += 1
         self.message_user(request, f'Marked {count} reconciliation(s) as matched.')
     mark_matched.short_description = _('Mark selected as matched')
 
     def mark_failed(self, request, queryset):
-        count = queryset.update(status='failed')
+        count = 0
+        for obj in queryset:
+            obj.status = 'failed'
+            obj.save(update_fields=['status'])
+            count += 1
         self.message_user(request, f'Marked {count} reconciliation(s) as failed.')
     mark_failed.short_description = _('Mark selected as failed')
 
@@ -834,7 +1011,9 @@ class PaymentDisputeAdmin(ModelAdmin):
     reason_display.short_description = _('Reason')
 
     def status_display(self, obj):
-        return obj.get_status_display()
+        colors = {'pending': 'orange', 'investigating': 'blue', 'resolved': 'green', 'rejected': 'red'}
+        color = colors.get(obj.status, 'gray')
+        return format_html('<span style="color: {};">{}</span>', color, obj.get_status_display())
     status_display.short_description = _('Status')
 
     def created_at_display(self, obj):
@@ -927,11 +1106,11 @@ class PaymentMethodAdmin(ModelAdmin):
     method_type_display.short_description = _('Method')
 
     def is_default_display(self, obj):
-        return '✓' if obj.is_default else ''
+        return format_html('<span style="color: green; font-weight: bold;">✓</span>' if obj.is_default else '')
     is_default_display.short_description = _('Default')
 
     def is_active_display(self, obj):
-        return '✓' if obj.is_active else '✗'
+        return format_html('<span style="color: green;">✓</span>' if obj.is_active else '<span style="color: red;">✗</span>')
     is_active_display.short_description = _('Active')
 
     def created_at_display(self, obj):
@@ -939,11 +1118,10 @@ class PaymentMethodAdmin(ModelAdmin):
     created_at_display.short_description = _('Created')
 
     def make_default(self, request, queryset):
-        # Reset default for all users in queryset
         for user in queryset.values_list('user', flat=True).distinct():
             PaymentMethod.objects.filter(user=user, is_default=True).update(is_default=False)
-        queryset.update(is_default=True)
-        self.message_user(request, f'Set {queryset.count()} payment method(s) as default.')
+        count = queryset.update(is_default=True)
+        self.message_user(request, f'Set {count} payment method(s) as default.')
     make_default.short_description = _('Make default')
 
     def activate(self, request, queryset):
