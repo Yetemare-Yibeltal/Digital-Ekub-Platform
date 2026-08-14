@@ -19,6 +19,7 @@ import logging
 import hashlib
 import hmac
 import uuid
+import os
 from decimal import Decimal
 from typing import Dict, Any, Optional, Union, List, Tuple
 from urllib.parse import urljoin
@@ -60,8 +61,8 @@ class ChapaGateway(BaseGateway):
     - Sandbox and production modes
 
     Configuration keys (in settings or passed to constructor):
-    - api_key: Your Chapa secret key
-    - public_key: Your Chapa public key
+    - api_key: Your Chapa secret key (from environment variable)
+    - public_key: Your Chapa public key (from environment variable)
     - webhook_secret: Secret for webhook signature verification
     - api_url: Base API URL (default: https://api.chapa.co/v1)
     - timeout: Request timeout in seconds (default: 30)
@@ -93,11 +94,11 @@ class ChapaGateway(BaseGateway):
         """
         super().__init__(config)
 
-        # Extract configuration
-        self.api_key = self.config.get('api_key', '')
-        self.public_key = self.config.get('public_key', '')
-        self.webhook_secret = self.config.get('webhook_secret', '')
-        self.api_url = self.config.get('api_url', 'https://api.chapa.co/v1')
+        # Extract configuration from environment or passed config
+        self.api_key = self.config.get('api_key') or os.environ.get('CHAPA_SECRET_KEY', '')
+        self.public_key = self.config.get('public_key') or os.environ.get('CHAPA_PUBLIC_KEY', '')
+        self.webhook_secret = self.config.get('webhook_secret') or os.environ.get('CHAPA_WEBHOOK_SECRET', '')
+        self.api_url = self.config.get('api_url', os.environ.get('CHAPA_API_URL', 'https://api.chapa.co/v1'))
         self.timeout = self.config.get('timeout', 30)
         self.sandbox = self.config.get('sandbox', False)
 
@@ -112,21 +113,20 @@ class ChapaGateway(BaseGateway):
     def _validate_config(self) -> None:
         """Validate that required configuration is present."""
         if not self.api_key:
-            raise GatewayConfigError('Chapa API key is required. Set CHAPA_SECRET_KEY in settings.')
+            raise GatewayConfigError(
+                'Chapa API key is required. Set CHAPA_SECRET_KEY in environment variables or pass in config.'
+            )
 
         if self.sandbox:
-            # Sandbox mode accepts test keys
-            if self.api_key == '""':
+            if self.api_key == 'your-placeholder':
                 logger.warning('Using default sandbox API key. This is insecure for production.')
         else:
-            # Production mode requires a valid API key
-            if self.api_key.startswith('""'):
+            if self.api_key.startswith('your-placeholder'):
                 logger.warning('Using test API key in production mode. Set CHAPA_SECRET_KEY to a production key.')
 
     def get_headers(self) -> Dict[str, str]:
         """Return headers for Chapa API requests."""
         headers = super().get_headers()
-        # Chapa uses 'Authorization: Bearer <api_key>'
         headers['Authorization'] = f'Bearer {self.api_key}'
         return headers
 
@@ -141,7 +141,7 @@ class ChapaGateway(BaseGateway):
         Initialize a payment with Chapa.
 
         Args:
-            amount: Amount to charge (in the smallest currency unit? Chapa expects decimal)
+            amount: Amount to charge
             currency: Currency code (ETB, USD)
             reference: Unique reference for this payment (must be unique)
             description: Description of the payment
@@ -156,11 +156,9 @@ class ChapaGateway(BaseGateway):
         if currency not in self.SUPPORTED_CURRENCIES:
             raise GatewayValidationError(f'Unsupported currency: {currency}. Supported: {self.SUPPORTED_CURRENCIES}')
 
-        # Ensure amount is positive
         if amount <= 0:
             raise GatewayValidationError('Amount must be greater than zero')
 
-        # Build request payload
         payload = {
             'amount': self.format_amount(amount),
             'currency': currency,
@@ -176,7 +174,6 @@ class ChapaGateway(BaseGateway):
             'meta': metadata or {},
         }
 
-        # If sandbox, add sandbox flag
         if self.sandbox:
             payload['sandbox'] = True
 
@@ -186,7 +183,6 @@ class ChapaGateway(BaseGateway):
             response = self._post(url, payload)
             data = response.json()
 
-            # Chapa returns: { "status": "success", "data": { "checkout_url": "...", "tx_ref": "...", "transaction_id": "...", "status": "pending" } }
             if data.get('status') == 'success':
                 result_data = data.get('data', {})
                 return GatewayResponse(
@@ -225,14 +221,12 @@ class ChapaGateway(BaseGateway):
         if not transaction_id:
             raise GatewayValidationError('Transaction ID is required')
 
-        # Chapa uses the reference to verify status
         url = urljoin(self.api_url, self.API_ENDPOINTS['verify'].format(reference=transaction_id))
 
         try:
             response = self._get(url)
             data = response.json()
 
-            # Chapa response: { "status": "success", "data": { "tx_ref": "...", "status": "completed", ... } }
             if data.get('status') == 'success':
                 result_data = data.get('data', {})
                 status_str = result_data.get('status', 'pending')
@@ -337,12 +331,10 @@ class ChapaGateway(BaseGateway):
         except GatewayWebhookError as e:
             raise GatewayWebhookError(f'Invalid webhook payload: {str(e)}')
 
-        # Extract event type
         event = data.get('event')
         if not event:
             raise GatewayWebhookError('Missing event type in webhook payload')
 
-        # Map event to internal status
         event_status_map = {
             'payment.completed': PaymentStatus.COMPLETED,
             'payment.failed': PaymentStatus.FAILED,
@@ -353,7 +345,6 @@ class ChapaGateway(BaseGateway):
         }
         status = event_status_map.get(event, PaymentStatus.UNKNOWN)
 
-        # Extract transaction data
         transaction_data = data.get('data', {})
         transaction_id = transaction_data.get('transaction_id') or transaction_data.get('tx_ref')
         reference = transaction_data.get('tx_ref')
@@ -394,14 +385,12 @@ class ChapaGateway(BaseGateway):
             logger.warning('Webhook secret not configured. Cannot validate signatures.')
             return False
 
-        # Chapa uses HMAC-SHA256
         expected = hmac.new(
             secret_key.encode('utf-8'),
             payload,
             hashlib.sha256
         ).hexdigest()
 
-        # Use constant-time comparison
         return hmac.compare_digest(expected, signature)
 
     # --------------------------------------------------------------------------
@@ -530,9 +519,9 @@ class ChapaGateway(BaseGateway):
         Check if Chapa is configured and available.
 
         Returns:
-            bool: True if CHAPA_SECRET_KEY is set
+            bool: True if CHAPA_SECRET_KEY is set in environment
         """
-        return bool(getattr(settings, 'CHAPA_SECRET_KEY', ''))
+        return bool(os.environ.get('CHAPA_SECRET_KEY', ''))
 
     @classmethod
     def get_required_config_keys(cls) -> List[str]:
@@ -558,13 +547,16 @@ class ChapaGateway(BaseGateway):
         """
         Get sandbox test keys for development.
 
+        These are placeholder keys that should be replaced with actual
+        sandbox credentials from Chapa dashboard. Do not commit real keys.
+
         Returns:
-            dict: Sandbox API keys
+            dict: Sandbox API keys (placeholders)
         """
         return {
-            'api_key': '""',
-            'public_key': 'pk_test_xxxxxxxxxxxxxxxxxxxxxxxx',
-            'webhook_secret': 'whsec_xxxxxxxxxxxxxxxxxxxxxxxx',
+            'api_key': os.environ.get('CHAPA_SECRET_KEY', 'your-chapa-secret-key-here'),
+            'public_key': os.environ.get('CHAPA_PUBLIC_KEY', 'your-chapa-public-key-here'),
+            'webhook_secret': os.environ.get('CHAPA_WEBHOOK_SECRET', 'your-chapa-webhook-secret-here'),
         }
 
     # --------------------------------------------------------------------------
@@ -646,14 +638,12 @@ class ChapaGateway(BaseGateway):
         else:
             raise GatewayError(f'Chapa API error: {message}', code=f'http_{response.status_code}')
 
-    # Override request methods to use custom error handling
     def _request(self, method: str, url: str, data: Optional[Dict] = None,
                  params: Optional[Dict] = None, headers: Optional[Dict] = None,
                  timeout: Optional[int] = None) -> requests.Response:
         """Override to add Chapa-specific error handling."""
         try:
             response = super()._request(method, url, data, params, headers, timeout)
-            # If response is not successful, handle it
             if response.status_code >= 400:
                 self._handle_api_error(response)
             return response
